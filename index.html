@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>File Dropbox</title>
+  <!-- Third-party libraries loaded from CDNs -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Basic styling for the root layout -->
+  <style> body, html { margin: 0; padding: 0; height: 100%; } #root { min-height: 100%; display: flex; flex-direction: column; } </style>
+</head>
+<body class="bg-zinc-100">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    /**
+     * @fileoverview This is the client-side JavaScript for the File Dropbox application.
+     * It uses React for the UI and implements a robust, resumable file uploader
+     * that communicates with a Cloudflare Worker proxy to handle uploads to Google Drive.
+     */
+
+    // --- CONFIGURATION ---
+
+    /**
+     * The URL of the Cloudflare Worker that acts as a secure proxy to initiate uploads.
+     * This MUST be replaced with your own deployed Cloudflare Worker URL.
+     * @type {string}
+     */
+    const INITIATION_URL = '--- ENTER YOUR CLOUDFLARE INITIATION URL HERE ---';
+
+    // --- UI HELPERS ---
+
+    /**
+     * Creates a Base64-encoded Data URI from raw SVG XML, allowing icons to be embedded directly.
+     * @param {string} svgXml - The raw SVG string.
+     * @returns {string} A Data URI string suitable for use in an `<img>` src attribute.
+     */
+    const createSvgDataUri = (svgXml) => `data:image/svg+xml;base64,${btoa(svgXml)}`;
+    
+    /**
+     * An object containing all embedded SVG icons used in the application.
+     * Colors are hard-coded to ensure correct appearance against the dark theme.
+     */
+    const ICONS = {
+      UPLOAD: createSvgDataUri('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="#d4d4d8"><path d="M8 2a5.53 5.53 0 0 0-3.594 1.342c-.766.66-1.321 1.52-1.464 2.383C1.266 6.095 0 7.555 0 9.318 0 11.366 1.708 13 3.781 13h8.906C14.502 13 16 11.57 16 9.773c0-1.636-1.242-2.969-2.834-3.194C12.923 3.999 10.69 2 8 2zm2.354 5.146a.5.5 0 0 1-.708.708L8.5 6.707V10.5a.5.5 0 0 1-1 0V6.707L6.354 7.854a.5.5 0 1 1-.708-.708l2-2a.5.5 0 0 1 .708 0l2 2z"/></svg>'),
+      TRASH: createSvgDataUri('<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#9ca3af"><path stroke-linecap="round" stroke-linejoin="round" d="M3 6h18M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2M10 11v6M14 11v6" /></svg>'),
+      CHECK: createSvgDataUri('<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#7fab21"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>'),
+      ERROR: createSvgDataUri('<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="#f87171"><path stroke-linecap="round" stroke-linejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" /></svg>'),
+    };
+    
+    /**
+     * Formats a number of bytes into a human-readable string (KB, MB, GB, etc.).
+     * @param {number} bytes - The number of bytes.
+     * @param {number} [decimals=2] - The number of decimal places to include.
+     * @returns {string} The formatted file size string.
+     */
+    const formatFileSize = (bytes, decimals = 2) => {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024;
+      const dm = decimals < 0 ? 0 : decimals;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      if (i >= sizes.length) return parseFloat((bytes / Math.pow(k, sizes.length - 1)).toFixed(dm)) + ' ' + sizes[sizes.length - 1];
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    };
+    
+    // --- UPLOADER LOGIC ---
+
+    /**
+     * A class to manage the entire lifecycle of a large, resumable file upload.
+     */
+    class ResumableUploader {
+      constructor(file, onStateChange) {
+        this.file = file;
+        this.onStateChange = onStateChange;
+        this.chunkSize = 10 * 1024 * 1024; // 10 MB chunks
+        this.uploadUrl = null;
+        this.bytesUploaded = 0;
+        this.progress = 0;
+        this.maxRetries = 5;
+        this.currentRetry = 0;
+      }
+      
+      /**
+       * Starts the upload process and handles the overall flow.
+       */
+      async start() {
+        try {
+          this.updateState('initiating', 0);
+          await this.initiateUpload();
+          await this.uploadChunks();
+          await this.sendNotification(); // Send notification upon success
+          this.updateState('success', 100);
+        } catch (error) {
+          console.error("Upload failed permanently for", this.file.name, error);
+          this.updateState('error', this.progress, error.message || "An unknown error occurred.");
+        }
+      }
+
+      /**
+       * Updates the parent component with the current state of the upload.
+       */
+      updateState(status, progress, error = null) {
+        this.progress = progress;
+        this.onStateChange({ status, progress, error });
+      }
+
+      /**
+       * Makes the initial call to the Cloudflare Worker to get a resumable upload URL.
+       */
+      async initiateUpload() {
+        if (!INITIATION_URL || INITIATION_URL.includes('PASTE')) throw new Error("Cloudflare Worker URL is not configured.");
+        const metadata = { fileName: this.file.name, mimeType: this.file.type || 'application/octet-stream' };
+        const response = await fetch(INITIATION_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(metadata) });
+        if (!response.ok) { const errData = await response.json().catch(() => ({error: 'Initiation request failed with status ' + response.status})); throw new Error(errData.error); }
+        const result = await response.json();
+        if (!result.success || !result.uploadUrl) throw new Error(result.error || "Failed to get upload URL from server.");
+        this.uploadUrl = result.uploadUrl;
+      }
+
+      /**
+       * Queries Google Drive to find out how many bytes of a file have been successfully uploaded.
+       * This is used to recover from failed chunks or expired sessions.
+       */
+      async queryUploadStatus() {
+        if (!this.uploadUrl) return;
+        try {
+          const response = await fetch(this.uploadUrl, { method: 'PUT', headers: { 'Content-Range': `bytes */${this.file.size}` } });
+          if (response.status === 308) { // 308 Resume Incomplete
+            const range = response.headers.get('Range');
+            if (range) {
+              const lastByte = parseInt(range.split('-')[1], 10);
+              this.bytesUploaded = lastByte + 1;
+              console.log(`Resuming from byte: ${this.bytesUploaded}`);
+            }
+          } else if (response.status === 200 || response.status === 201) { // Upload already finished
+              this.bytesUploaded = this.file.size;
+          } else { // Session is dead
+              console.log('Session is dead. Re-initiating.');
+              await this.initiateUpload(); // Get a new URL
+              this.bytesUploaded = 0; // Start from scratch with new URL
+          }
+        } catch(e) {
+            console.error("Error querying upload status:", e);
+            throw new Error("Could not recover upload status.");
+        }
+      }
+
+      /**
+       * Uploads the file in chunks, with a retry mechanism for failures.
+       */
+      async uploadChunks() {
+        while (this.bytesUploaded < this.file.size) {
+          try {
+            const start = this.bytesUploaded;
+            const end = Math.min(start + this.chunkSize, this.file.size);
+            const chunk = this.file.slice(start, end);
+            const response = await fetch(this.uploadUrl, { method: 'PUT', headers: { 'Content-Range': `bytes ${start}-${end - 1}/${this.file.size}` }, body: chunk });
+            if (response.status === 308 || response.status === 200 || response.status === 201) {
+              this.bytesUploaded = (response.status === 308 && response.headers.has('Range')) ? parseInt(response.headers.get('Range').split('-')[1], 10) + 1 : end;
+              const progress = Math.round((this.bytesUploaded / this.file.size) * 100);
+              this.updateState('uploading', progress);
+              this.currentRetry = 0; // Success, reset retry counter
+            } else {
+              throw new Error(`Unexpected status ${response.status}`);
+            }
+          } catch (error) {
+            console.warn(`Chunk upload failed: ${error.message}. Attempting recovery.`);
+            this.currentRetry++;
+            if (this.currentRetry > this.maxRetries) { throw new Error(`Exceeded max retries. Upload failed.`); }
+            await this.queryUploadStatus();
+          }
+        }
+      }
+      
+      /**
+       * Calls the backend Apps Script function to send an email notification.
+       */
+      async sendNotification() {
+        console.log("Sending email notification for:", this.file.name);
+        return new Promise((resolve) => {
+          google.script.run
+            .withSuccessHandler(response => {
+              if (response && response.success) { console.log("Email notification sent successfully."); } 
+              else { console.error("Server failed to send email:", response ? response.error : "Unknown error"); }
+              resolve(); // Always resolve so UI doesn't get stuck on email failure
+            })
+            .withFailureHandler(error => {
+              console.error("google.script.run failed to send email:", error.message);
+              resolve(); // Always resolve
+            })
+            .sendEmailNotification(this.file.name);
+        });
+      }
+    }
+
+    // --- REACT COMPONENTS ---
+
+    /**
+     * A single item in the upload list, showing the file name, progress, and status.
+     */
+    const FileItem = ({ uploadableFile, onRemove }) => { const { file, status, progress, error } = uploadableFile; const getStatusText = () => { switch(status) { case 'pending': return 'Waiting in queue...'; case 'initiating': return 'Preparing secure upload...'; case 'uploading': return `${formatFileSize(file.size * (progress / 100))} / ${formatFileSize(file.size)}`; case 'success': return 'Upload complete!'; case 'error': return 'Upload failed'; default: return ''; } }; return ( <div className="flex flex-col p-3 bg-zinc-700 rounded-md shadow space-y-2"> <div className="flex items-center justify-between"> <span className="text-sm font-medium text-zinc-200 truncate" title={file.name}>{file.name}</span> <button onClick={() => onRemove(uploadableFile.id)} className="p-1 rounded-full text-zinc-400 hover:text-red-500 hover:bg-zinc-600" title="Remove from list"> <img src={ICONS.TRASH} className="w-5 h-5" /> </button> </div> <div className="w-full bg-zinc-600 rounded-full h-2.5"> <div className="bg-lime-500 h-2.5 rounded-full" style={{ width: `${progress}%`, transition: 'width 0.3s ease-in-out' }}></div> </div> <div className="flex justify-between items-center text-xs text-zinc-400"> <span>{getStatusText()}</span> {status === 'success' ? <img src={ICONS.CHECK} className="w-4 h-4" /> : <span>{progress}%</span>} </div> {status === 'error' && error && <span className="text-xs text-red-400 truncate" title={error}>Error: {error}</span>} </div> ); };
+    
+    /**
+     * The container for all FileItem components.
+     */
+    const FileList = ({ files, onRemoveFile }) => { if (files.length === 0) return null; return ( <div className="space-y-3 max-h-96 overflow-y-auto pr-2 bg-zinc-850 rounded-lg p-1"> {files.map((file) => <FileItem key={file.id} uploadableFile={file} onRemove={onRemoveFile} />)} </div> ); };
+    
+    /**
+     * The main drag-and-drop area for adding files.
+     */
+    const FileDropzone = ({ onFilesAdded, isDraggingOver, onDragOver, onDragEnter, onDragLeave }) => { const fileInputRef = React.useRef(null); const handleDrop = React.useCallback((event) => { event.preventDefault(); event.stopPropagation(); const droppedFiles = Array.from(event.dataTransfer.files); if (droppedFiles.length > 0) onFilesAdded(droppedFiles); }, [onFilesAdded]); const handleFileSelect = React.useCallback((event) => { const selectedFiles = Array.from(event.target.files || []); if (selectedFiles.length > 0) onFilesAdded(selectedFiles); if(fileInputRef.current) fileInputRef.current.value = ""; }, [onFilesAdded]); const handleClick = React.useCallback(() => fileInputRef.current?.click(), []); const dropzoneClasses = `border-4 rounded-lg p-8 md:p-12 text-center transition-all duration-200 ease-in-out flex flex-col items-center justify-center space-y-4 cursor-pointer ${isDraggingOver ? 'border-lime-500 bg-zinc-700' : 'border-dashed border-zinc-600 hover:border-zinc-500'}`; return ( <div onClick={handleClick} onDrop={handleDrop} onDragOver={onDragOver} onDragEnter={onDragEnter} onDragLeave={onDragLeave} className={dropzoneClasses}> <input type="file" multiple ref={fileInputRef} onChange={handleFileSelect} className="hidden" /> <img src={ICONS.UPLOAD} className="w-16 h-16" /> <p className={`text-lg ${isDraggingOver ? 'text-lime-300' : 'text-zinc-400'} font-medium`}> {isDraggingOver ? 'Drop files here!' : 'Drag & drop files here, or click to select'} </p> <p className="text-sm text-zinc-500">Files are uploaded to our Google account.</p> </div> ); };
+    
+    /**
+     * The main root component of the React application.
+     */
+    const App = () => { const [uploadableFiles, setUploadableFiles] = React.useState([]); const [isDraggingOver, setIsDraggingOver] = React.useState(false); const handleFilesAdded = React.useCallback((newFiles) => { const newUploadableFiles = newFiles.map(file => ({ id: `${file.name}-${Date.now()}`, file, status: 'pending', progress: 0, error: null })); setUploadableFiles(prevFiles => [...prevFiles, ...newUploadableFiles]); setIsDraggingOver(false); newUploadableFiles.forEach(uf => { const onStateChange = (newState) => { setUploadableFiles(prev => prev.map(f => f.id === uf.id ? { ...f, ...newState } : f)); }; const uploader = new ResumableUploader(uf.file, onStateChange); uploader.start(); }); }, []); const handleRemoveFile = React.useCallback((fileIdToRemove) => { setUploadableFiles(prevFiles => prevFiles.filter(f => f.id !== fileIdToRemove)); }, []); const handleDragEvents = React.useCallback((e, isOver) => { e.preventDefault(); e.stopPropagation(); setIsDraggingOver(isOver); }, []); const handleDragOver = React.useCallback((e) => handleDragEvents(e, true), [handleDragEvents]); const handleDragEnter = React.useCallback((e) => handleDragEvents(e, true), [handleDragEvents]); const handleDragLeave = React.useCallback((e) => { if (e.currentTarget && !e.currentTarget.contains(e.relatedTarget)) { handleDragEvents(e, false); } }, [handleDragEvents]); return ( <div className="min-h-screen flex flex-col items-center justify-start p-4 bg-zinc-900 text-white"> <div className="w-full max-w-2xl mx-auto bg-zinc-800 shadow-2xl rounded-xl p-6 md:p-10 mt-8 mb-8"> <header className="mb-6 text-center"> <h1 className="text-4xl font-bold" style={{color: '#7fab21'}}>File Dropbox</h1> <p className="text-zinc-400 mt-2">Securely submit content and other files.</p> </header> <FileDropzone onFilesAdded={handleFilesAdded} isDraggingOver={isDraggingOver} onDragOver={handleDragOver} onDragEnter={handleDragEnter} onDragLeave={handleDragLeave} /> {uploadableFiles.length > 0 && ( <div className="mt-8"> <h2 className="text-2xl font-semibold mb-4 text-zinc-300">Upload Queue</h2> <FileList files={uploadableFiles} onRemoveFile={handleRemoveFile} /> </div> )} {uploadableFiles.length === 0 && ( <div className="mt-8 text-center text-zinc-500"> <p>No files uploaded yet.</p> </div> )} </div> <footer className="mt-auto mb-4 text-center text-zinc-500 text-sm"> <p>© Your Company Name</p> </footer> </div> ); };
+    
+    // --- APPLICATION BOOTSTRAP ---
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
