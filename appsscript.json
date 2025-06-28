@@ -1,0 +1,13 @@
+{
+  "timeZone": "--- ENTER YOUR TIME ZONE HERE. (EXAMPLE: America/New_York) ---",
+  "dependencies": {},
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8",
+  "webapp": {
+    "executeAs": "USER_DEPLOYING",
+    "access": "ANYONE"
+  },
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/script.send_mail"
+  ]
+}
